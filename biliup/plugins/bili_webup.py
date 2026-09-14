@@ -11,7 +11,7 @@ import urllib.parse
 from dataclasses import asdict, dataclass, field, InitVar
 from json import JSONDecodeError
 from os.path import splitext, basename
-from typing import Union, Any, List
+from typing import Union, Any, List, Optional, Callable
 from urllib import parse
 from urllib.parse import quote
 
@@ -21,27 +21,79 @@ import rsa
 import xml.etree.ElementTree as ET
 from requests.adapters import HTTPAdapter, Retry
 
-from biliup.config import config
-from ..engine import Plugin
-from ..engine.upload import UploadBase, logger
+import logging
+from typing import NamedTuple
 
 
-@Plugin.upload(platform="bili_web")
-class BiliWeb(UploadBase):
+logger = logging.getLogger('biliup')
+
+
+def _safe_response_status(response):
+    """Return only fixed, non-credential status fields for logging."""
+    if not isinstance(response, dict):
+        return {"type": type(response).__name__}
+    return {key: response[key] for key in ("code", "OK") if key in response}
+
+
+class FileInfo(NamedTuple):
+    video: str
+    danmaku: Optional[str] = None
+
+
+class BiliWeb:
     def __init__(
-            self, principal, data, user, submit_api=None, copyright=2, postprocessor=None, dtime=None,
-            dynamic='', lines='AUTO', threads=3, tid=122, tags=None, cover_path=None, description='', credits=[]
+        self,
+        principal,
+        data,
+        user,
+        user_cookie='cookies.json',
+        submit_api: Optional[str] = 'web',
+        copyright: int = 2,
+        postprocessor: Optional[Callable] = None,
+        dtime: Optional[int] = None,
+        dynamic='',
+        lines: Optional[str] = 'AUTO',
+        threads: int = 3,
+        tid: int = 122,
+        tid_v2: Optional[int] = None,
+        tags: Optional[List[str]] = None,
+        cover_path=None,
+        description='',
+        credits=[],
     ):
-        super().__init__(principal, data, persistence_path='bili.cookie', postprocessor=postprocessor)
+        """
+        :param principal:
+        :param data:
+        :param user_cookie: 投稿用户cookie文件
+        :param submit_api:
+        :param copyright:
+        :param postprocessor:
+        :param dtime: 延时发布时间。需距离提交大于4小时，格式为10位时间戳
+        :param dynamic:
+        :param lines: 上传线路
+        :param threads: 上传线程数
+        :param tid: 稿件分区
+        :param tid_v2: 新版稿件分区（可选）
+        :param tags: 稿件标签
+        :param cover_path: 稿件封面路径
+        :param description: 视频简介
+        :param credits: ???
+        """
+        self.principal = principal
+        self.data: dict = data
+        self.persistence_path = 'bili.cookie'
+        self.post_processor = postprocessor
         if tags is None:
             tags = []
         else:
             tags = [str(tag).format(streamer=self.data['name']) for tag in tags]
-        self.user = user
+        self.user = user # 旧版本的登录用户
+        self.user_cookie = user_cookie # 新版本的登录用户cookie文件
         self.lines = lines
-        self.submit_api = submit_api
+        self.submit_api = submit_api or 'web'
         self.threads = threads
         self.tid = tid
+        self.tid_v2 = tid_v2
         self.tags = tags
         self.cover_path = cover_path
         self.desc = description
@@ -50,13 +102,24 @@ class BiliWeb(UploadBase):
         self.copyright = copyright
         self.dtime = dtime
 
-    def upload(self, file_list: List[UploadBase.FileInfo]) -> List[UploadBase.FileInfo]:
+    def upload(
+        self,
+        file_list: List[FileInfo],
+        database_row_id: int = 0
+    ) -> List[FileInfo]:
+        '''
+        上传视频
+        :param file_list: 视频文件名列表
+        :param database_row_id: 数据库行ID
+        :return: 上传结果
+        '''
+        logger.info(f"开始上传视频 {database_row_id}")
         video = Data()
         video.dynamic = self.dynamic
         with BiliBili(video) as bili:
             bili.app_key = self.user.get('app_key')
             bili.appsec = self.user.get('appsec')
-            bili.login(self.persistence_path, self.user)
+            bili.login(self.persistence_path, self.user_cookie)
             for file in file_list:
                 video_part = bili.upload_file(file.video, self.lines, self.threads)  # 上传视频
                 video_part['title'] = video_part['title'][:80]
@@ -76,13 +139,15 @@ class BiliWeb(UploadBase):
                 video.source = self.data["url"]  # 添加转载地址说明
             # 设置视频分区,默认为174 生活，其他分区
             video.tid = self.tid
+            if self.tid_v2 is not None:
+                video.tid_v2 = self.tid_v2
             video.set_tag(self.tags)
             if self.dtime:
                 video.delay_time(int(time.time()) + self.dtime)
             if self.cover_path:
                 video.cover = bili.cover_up(self.cover_path).replace('http:', '')
             ret = bili.submit(self.submit_api)  # 提交视频
-        logger.info(f"上传成功: {ret}")
+        logger.info("上传成功: %s", _safe_response_status(ret))
         return file_list
 
     def creditsToDesc_v2(self):
@@ -186,17 +251,11 @@ class BiliBili:
         response = self.__session.get('http://api.bilibili.com/x/space/myinfo')
         return response.json()
 
-    def login(self, persistence_path, user):
-        self.persistence_path = persistence_path
-        if os.path.isfile(persistence_path):
+    def login(self, persistence_path, user_cookie):
+        self.persistence_path = user_cookie
+        if os.path.isfile(self.persistence_path):
             print('使用持久化内容上传')
             self.load()
-        if user.get('cookies'):
-            self.cookies = user['cookies']
-        if user.get('access_token'):
-            self.access_token = user['access_token']
-        if user.get('account'):
-            self.account = user['account']
         if self.cookies:
             try:
                 self.login_by_cookies(self.cookies)
@@ -211,7 +270,8 @@ class BiliBili:
         try:
             with open(self.persistence_path) as f:
                 self.cookies = json.load(f)
-                self.access_token = self.cookies['access_token']
+                self.access_token = self.cookies['token_info']['access_token']
+                self.refresh_token = self.cookies['token_info']['refresh_token']
         except (JSONDecodeError, KeyError):
             logger.exception('加载cookie出错')
 
@@ -277,7 +337,7 @@ class BiliBili:
                                        data={**payload, 'sign': self.sign(parse.urlencode(payload))})
         r = response.json()
         if r['code'] != 0 or r.get('data') is None or r['data'].get('cookie_info') is None:
-            raise RuntimeError(r)
+            raise RuntimeError(f"password login failed: {_safe_response_status(r)}")
         try:
             for cookie in r['data']['cookie_info']['cookies']:
                 self.__session.cookies.set(cookie['name'], cookie['value'])
@@ -286,18 +346,22 @@ class BiliBili:
             self.cookies = self.__session.cookies.get_dict()
             self.access_token = r['data']['token_info']['access_token']
             self.refresh_token = r['data']['token_info']['refresh_token']
-        except:
-            raise RuntimeError(r)
+        except Exception as error:
+            raise RuntimeError(
+                f"password login response was incomplete: {_safe_response_status(r)}"
+            ) from error
         return r
 
     def login_by_cookies(self, cookie):
-        print('使用cookies上传')
-        requests.utils.add_dict_to_cookiejar(self.__session.cookies, cookie)
-        if 'bili_jct' in cookie:
-            self.__bili_jct = cookie["bili_jct"]
+        logger.info(f'{self.__class__.__name__}: login by cookies')
+        cookies_dict = {c['name']: c['value'] for c in cookie['cookie_info']['cookies']}
+        requests.utils.add_dict_to_cookiejar(self.__session.cookies, cookies_dict)
+        if 'bili_jct' in cookies_dict:
+            self.__bili_jct = cookies_dict['bili_jct']
         data = self.__session.get("https://api.bilibili.com/x/web-interface/nav", timeout=5).json()
         if data["code"] != 0:
-            raise Exception(data)
+            raise RuntimeError(f"cookie login failed: {_safe_response_status(data)}")
+        print('使用cookies上传')
 
     def sign(self, param):
         return hashlib.md5(f"{param}{self.appsec}".encode()).hexdigest()
@@ -346,22 +410,10 @@ class BiliBili:
         """
         preferred_upos_cdn = None
         if not self._auto_os:
-            if lines == 'bda':
-                self._auto_os = {"os": "upos", "query": "upcdn=bda&probe_version=20221109",
-                                 "probe_url": "//upos-cs-upcdnbda.bilivideo.com/OK"}
-                preferred_upos_cdn = 'bda'
-            elif lines in {'bda2', 'cs-bda2'}:
+            if lines in {'bda2', 'cs-bda2'}:
                 self._auto_os = {"os": "upos", "query": "upcdn=bda2&probe_version=20221109",
                                  "probe_url": "//upos-cs-upcdnbda2.bilivideo.com/OK"}
                 preferred_upos_cdn = 'bda2'
-            elif lines == 'ws':
-                self._auto_os = {"os": "upos", "query": "upcdn=ws&probe_version=20221109",
-                                 "probe_url": "//upos-cs-upcdnws.bilivideo.com/OK"}
-                preferred_upos_cdn = 'ws'
-            elif lines in {'qn', 'cs-qn'}:
-                self._auto_os = {"os": "upos", "query": "upcdn=qn&probe_version=20221109",
-                                 "probe_url": "//upos-cs-upcdnqn.bilivideo.com/OK"}
-                preferred_upos_cdn = 'qn'
             elif lines == 'bldsa':
                 self._auto_os = {"os": "upos", "query": "upcdn=bldsa&probe_version=20221109",
                                  "probe_url": "//upos-cs-upcdnbldsa.bilivideo.com/OK"}
@@ -374,6 +426,18 @@ class BiliBili:
                 self._auto_os = {"os": "upos", "query": "upcdn=txa&probe_version=20221109",
                                  "probe_url": "//upos-cs-upcdntxa.bilivideo.com/OK"}
                 preferred_upos_cdn = 'txa'
+            elif lines == 'alia':
+                self._auto_os = {"os": "upos", "query": "upcdn=alia&probe_version=20221109",
+                                 "probe_url": "//upos-cs-upcdnalia.bilivideo.com/OK"}
+                preferred_upos_cdn = 'alia'
+            elif lines == 'estx':
+                self._auto_os = {"os": "upos",
+                                 "query": "probe_version=20250923&upcdn=estx&zone=cs",
+                                 "probe_url": "//e17962d5cstx.esheep.com/OK"}
+            elif lines == 'akbd':
+                self._auto_os = {"os": "upos",
+                                 "query": "probe_version=20250923&upcdn=akbd&zone=cs",
+                                 "probe_url": "//bb27c891csbd.aikobo.cn/OK"}
             else:
                 self._auto_os = self.probe()
             logger.info(f"线路选择 => {self._auto_os['os']}: {self._auto_os['query']}. time: {self._auto_os.get('cost')}")
@@ -404,13 +468,17 @@ class BiliBili:
                 f"https://member.bilibili.com/preupload?{self._auto_os['query']}", params=query,
                 timeout=5)
             ret = resp.json()
-            logger.debug(f"preupload: {ret}")
+            logger.debug(
+                "preupload response accepted: storage=%s chunk_size=%s",
+                self._auto_os['os'],
+                ret.get('chunk_size'),
+            )
             if preferred_upos_cdn:
                 original_endpoint: str = ret['endpoint']
-                if re.match(r'//upos-(sz|cs)-upcdn(bda2|ws|qn)\.bilivideo\.com', original_endpoint):
-                    if re.match(r'bda2|qn|ws', preferred_upos_cdn):
+                if re.match(r'//upos-(sz|cs)-upcdnbda2\.bilivideo\.com', original_endpoint):
+                    if re.match(r'bda2', preferred_upos_cdn):
                         logger.debug(f"Preferred UpOS CDN: {preferred_upos_cdn}")
-                        new_endpoint = re.sub(r'upcdn(bda2|qn|ws)', f'upcdn{preferred_upos_cdn}', original_endpoint)
+                        new_endpoint = re.sub(r'upcdnbda2', f'upcdn{preferred_upos_cdn}', original_endpoint)
                         logger.debug(f"{original_endpoint} => {new_endpoint}")
                         ret['endpoint'] = new_endpoint
                     else:
@@ -475,7 +543,7 @@ class BiliBili:
                                           timeout=15)
                 if res.status_code == 200:
                     break
-                raise IOError(res.text)
+                raise IOError(f"merge request failed with HTTP {res.status_code}")
             except IOError:
                 ii += 1
                 logger.info("请求合并分片出现问题，尝试重连，次数：" + str(ii))
@@ -485,9 +553,9 @@ class BiliBili:
             try:
                 res = self.__session.post("https:" + ret["fetch_url"], headers=fetch_headers, timeout=15).json()
                 if res.get('OK') == 1:
-                    logger.info(f'{filename} uploaded >> {total_size / 1000 / 1000 / cost:.2f}MB/s. {res}')
-                    return {"title": splitext(filename)[0], "filename": ret["bili_filename"], "desc": ""}
-                raise IOError(res)
+                    logger.info(f'{filename} uploaded >> {total_size / 1000 / 1000 / cost:.2f}MB/s')
+                    return {"title": splitext(os.path.basename(filename))[0], "filename": ret["bili_filename"], "desc": ""}
+                raise IOError(f"fetch failed: {_safe_response_status(res)}")
             except IOError:
                 ii += 1
                 logger.info("上传出现问题，尝试重连，次数：" + str(ii))
@@ -528,8 +596,8 @@ class BiliBili:
                             data=','.join(map(lambda x: x['ctx'], parts)), headers=headers, timeout=10)
         r = self.__session.post(f"https:{fetch_url}", headers=fetch_headers, timeout=5).json()
         if r["OK"] != 1:
-            raise Exception(r)
-        return {"title": splitext(filename)[0], "filename": bili_filename, "desc": ""}
+            raise RuntimeError(f"Kodo fetch failed: {_safe_response_status(r)}")
+        return {"title": splitext(os.path.basename(filename))[0], "filename": bili_filename, "desc": ""}
 
     async def upos(self, file, total_size, ret, tasks=3):
         filename = file.name
@@ -576,9 +644,9 @@ class BiliBili:
             try:
                 r = self.__session.post(url, params=p, json={"parts": parts}, headers=headers, timeout=15).json()
                 if r.get('OK') == 1:
-                    logger.info(f'{filename} uploaded >> {total_size / 1000 / 1000 / cost:.2f}MB/s. {r}')
-                    return {"title": splitext(filename)[0], "filename": splitext(basename(upos_uri))[0], "desc": ""}
-                raise IOError(r)
+                    logger.info(f'{filename} uploaded >> {total_size / 1000 / 1000 / cost:.2f}MB/s')
+                    return {"title": splitext(os.path.basename(filename))[0], "filename": splitext(basename(upos_uri))[0], "desc": ""}
+                raise IOError(f"UPOS merge failed: {_safe_response_status(r)}")
             except IOError:
                 attempt += 1
                 logger.info(f"请求合并分片时出现问题，尝试重连，次数：" + str(attempt))
@@ -603,13 +671,18 @@ class BiliBili:
                     try:
                         await afunc(session, chunks_data, clone)
                         break
-                    except (asyncio.TimeoutError, aiohttp.ClientError) as e:
-                        logger.error(f"retry chunk{clone['chunk']} >> {i + 1}. {e}")
+                    except (asyncio.TimeoutError, aiohttp.ClientError) as error:
+                        logger.error(
+                            "retry chunk%s >> %s (%s)",
+                            clone['chunk'],
+                            i + 1,
+                            type(error).__name__,
+                        )
 
         async with aiohttp.ClientSession() as session:
             await asyncio.gather(*[upload_chunk() for _ in range(tasks)])
 
-    def submit(self, submit_api=None):
+    def submit(self, submit_api: Optional[str] = 'web'):
         if not self.video.title:
             self.video.title = self.video.videos[0]["title"]
         self.__session.get('https://member.bilibili.com/x/geetest/pre/add', timeout=5)
@@ -617,33 +690,31 @@ class BiliBili:
         if submit_api is None:
             total_info = self.__session.get('http://api.bilibili.com/x/space/myinfo', timeout=15).json()
             if total_info.get('data') is None:
-                logger.error(total_info)
+                logger.error("用户信息接口未返回 data: %s", _safe_response_status(total_info))
             total_info = total_info.get('data')
             if total_info['level'] > 3 and total_info['follower'] > 1000:
                 user_weight = 2
             else:
                 user_weight = 1
             logger.info(f'用户权重: {user_weight}')
-            submit_api = 'web' if user_weight == 2 else 'client'
+            submit_api = 'web'
         ret = None
         if submit_api == 'web':
             ret = self.submit_web()
-            if ret["code"] == 21138:
-                logger.info(f'改用客户端接口提交{ret}')
-                submit_api = 'client'
-        if submit_api == 'client':
-            ret = self.submit_client()
+            if ret["code"] != 0:
+                logger.error("网页端接口提交失败: %s", _safe_response_status(ret))
+                raise RuntimeError(f"网页端接口提交失败: {_safe_response_status(ret)}")
         if not ret:
             raise Exception(f'不存在的选项：{submit_api}')
-        if ret["code"] == 0:
-            return ret
-        else:
-            raise Exception(ret)
+        return ret
 
     def submit_web(self):
         logger.info('使用网页端api提交')
+        post_data = asdict(self.video)
+        if post_data.get('tid_v2') is None:
+            post_data.pop('tid_v2', None)
         return self.__session.post(f'https://member.bilibili.com/x/vu/web/add?csrf={self.__bili_jct}', timeout=5,
-                                   json=asdict(self.video)).json()
+                                   json=post_data).json()
 
     def submit_client(self):
         logger.info('使用客户端api端提交')
@@ -653,10 +724,13 @@ class BiliBili:
             self.login_by_password(**self.account)
             self.store()
         while True:
+            post_data = asdict(self.video)
+            if post_data.get('tid_v2') is None:
+                post_data.pop('tid_v2', None)
             ret = self.__session.post(f'http://member.bilibili.com/x/vu/client/add?access_key={self.access_token}',
-                                      timeout=5, json=asdict(self.video)).json()
+                                      timeout=5, json=post_data).json()
             if ret['code'] == -101:
-                logger.info(f'刷新token{ret}')
+                logger.info("客户端登录状态失效，正在刷新凭据: %s", _safe_response_status(ret))
                 self.login_by_password(**config['user']['account'])
                 self.store()
                 continue
@@ -691,7 +765,7 @@ class BiliBili:
         buffered.close()
         res = r.json()
         if res.get('data') is None:
-            raise Exception(res)
+            raise RuntimeError(f"cover upload failed: {_safe_response_status(res)}")
         return res['data']['url']
 
     def get_tags(self, upvideo, typeid="", desc="", cover="", groupid=1, vfea=""):
@@ -709,6 +783,199 @@ class BiliBili:
               f'typeid={typeid}&title={quote(upvideo["title"])}&filename=filename&desc={desc}&cover={cover}' \
               f'&groupid={groupid}&vfea={vfea}'
         return self.__session.get(url=url, timeout=5).json()
+
+    # ==================== 合集（SEASON）管理 ====================
+    #
+    # B站"新版合集"（SEASON 类型）的管理接口，支持：
+    #   - 列出用户的所有合集
+    #   - 查看合集内的视频列表
+    #   - 将视频添加到合集
+    #   - 从合集中移除视频
+    #   - 对合集内视频重新排序
+    #
+    # 核心概念：
+    #   season_id  - 合集ID，从创作中心合集管理页面的URL或 list_seasons() 获取
+    #   section_id - 合集下的"分区"ID，每个合集至少有一个默认分区，
+    #                通过 list_seasons() 返回的 sections.sections[0].id 获取
+    #   episode_id - 视频在合集中的内部ID（不是 aid），
+    #                通过 get_season_section() 返回的 episodes[i]['id'] 获取
+    #
+    # 典型流程（上传后添加到合集）：
+    #   1. seasons = bili.list_seasons()  # 获取合集列表，找到 season_id 和 section_id
+    #   2. info = bili.get_video_info(aid)  # 获取视频的 cid 和 title
+    #   3. bili.add_to_season(section_id, [{...}])  # 添加到合集
+    def list_seasons(self, pn=1, ps=30):
+        """
+        获取用户的合集列表
+
+        返回值示例::
+
+            {
+                'seasons': [{
+                    'season': {'id': 7320255, 'title': '我的合集', ...},
+                    'sections': {'sections': [{'id': 8081933, 'title': '正片', ...}]}
+                }, ...],
+                'page': {'pn': 1, 'ps': 30, 'total': 5}
+            }
+
+        获取 section_id 的方式：
+        ``data['seasons'][0]['sections']['sections'][0]['id']``
+
+        :param pn: 页码，从1开始
+        :param ps: 每页数量，默认30
+        :return: 包含 seasons 列表和分页信息的 dict
+        """
+        r = self.__session.get(
+            'https://member.bilibili.com/x2/creative/web/seasons',
+            params={'pn': pn, 'ps': ps, 'order': 'mtime', 'sort': 'desc', 'draft': 1},
+            timeout=10
+        ).json()
+        if r['code'] != 0:
+            raise RuntimeError(f"list seasons failed: {_safe_response_status(r)}")
+        return r['data']
+
+    def get_season_section(self, section_id, sort=''):
+        """
+        获取合集分区内的视频列表
+
+        返回值中每个 episode 包含::
+
+            {'id': 176218279, 'aid': 12345, 'cid': 67890, 'title': '...', ...}
+
+        其中 ``id`` 是 episode_id（合集内部ID），用于 remove_from_season 和排序。
+
+        :param section_id: 分区ID，通过 list_seasons() 获取
+        :param sort: 排序方式，可选 'desc'（降序）
+        :return: 包含 section 信息和 episodes 列表的 dict
+        """
+        params = {'id': section_id}
+        if sort:
+            params['sort'] = sort
+        r = self.__session.get(
+            'https://member.bilibili.com/x2/creative/web/season/section',
+            params=params, timeout=10
+        ).json()
+        if r['code'] != 0:
+            raise RuntimeError(f"get season section failed: {_safe_response_status(r)}")
+        return r['data']
+
+    def get_video_info(self, aid):
+        """
+        获取视频信息（标题、cid 等），用于添加到合集前获取必要参数
+
+        :param aid: 视频AV号（整数）
+        :return: 视频信息 dict，包含 title, pages[0].cid 等
+        """
+        r = self.__session.get(
+            'https://api.bilibili.com/x/web-interface/view',
+            params={'aid': aid}, timeout=10
+        ).json()
+        if r['code'] != 0:
+            raise RuntimeError(f"get video info failed: {_safe_response_status(r)}")
+        return r['data']
+
+    def add_to_season(self, section_id, episodes):
+        """
+        将视频添加到合集（新版合集/SEASON）
+
+        添加单个视频的典型用法::
+
+            info = bili.get_video_info(aid)
+            bili.add_to_season(section_id, [{
+                'aid': aid,
+                'cid': info['pages'][0]['cid'],
+                'title': info['title'],
+                'charging_pay': 0,
+            }])
+
+        可一次添加多个视频（传入多个 episode dict）。
+
+        :param section_id: 分区ID，通过 list_seasons() 获取
+        :param episodes: 视频列表，每项须含 aid, cid, title, charging_pay
+        :return: API 返回的 JSON
+        :raises Exception: API 返回 code != 0 时抛出
+        """
+        r = self.__session.post(
+            f'https://member.bilibili.com/x2/creative/web/season/section/episodes/add'
+            f'?csrf={self.__bili_jct}',
+            json={
+                'sectionId': section_id,
+                'episodes': episodes,
+                'csrf': self.__bili_jct,
+            },
+            headers={'Content-Type': 'application/json; charset=UTF-8'},
+            timeout=10
+        ).json()
+        if r['code'] != 0:
+            raise RuntimeError(f"add to season failed: {_safe_response_status(r)}")
+        return r
+
+    def remove_from_season(self, episode_id):
+        """
+        从合集中移除一个视频
+
+        注意：参数是 episode_id（合集内部ID），不是 aid。
+        需要先通过 get_season_section() 获取 episodes 列表，
+        找到目标视频的 ``episode['id']`` 字段。
+
+        每次只能移除一个视频，批量移除需要循环调用。
+
+        :param episode_id: 合集内部的 episode ID（不是 aid）
+        :return: API 返回的 JSON
+        :raises Exception: API 返回 code != 0 时抛出
+        """
+        r = self.__session.post(
+            'https://member.bilibili.com/x2/creative/web/season/section/episode/del',
+            data={'id': episode_id, 'csrf': self.__bili_jct},
+            timeout=10
+        ).json()
+        if r['code'] != 0:
+            raise RuntimeError(f"remove from season failed: {_safe_response_status(r)}")
+        return r
+
+    def sort_season_episodes(self, section_id, season_id, sorts, section_title='正片'):
+        """
+        对合集内的视频重新排序
+
+        使用示例::
+
+            section = bili.get_season_section(section_id)
+            eps = section['episodes']
+            # 反转顺序
+            sorts = [{'id': ep['id'], 'sort': i+1} for i, ep in enumerate(reversed(eps))]
+            bili.sort_season_episodes(section_id, season_id, sorts)
+
+        注意事项：
+        - sorts 必须包含合集中的**所有**视频，不能只传部分
+        - section_id、season_id、section_title 三个参数缺一不可，否则返回 -400
+        - sort 序号从1开始
+
+        :param section_id: 分区ID
+        :param season_id: 合集ID
+        :param sorts: 排序数组，每项含 id (episode_id) 和 sort (1-indexed 序号)
+        :param section_title: 分区标题，默认"正片"
+        :return: API 返回的 JSON
+        :raises Exception: API 返回 code != 0 时抛出
+        """
+        r = self.__session.post(
+            f'https://member.bilibili.com/x2/creative/web/season/section/edit'
+            f'?csrf={self.__bili_jct}',
+            json={
+                'section': {
+                    'id': section_id,
+                    'type': 1,
+                    'seasonId': season_id,
+                    'title': section_title,
+                },
+                'sorts': sorts,
+                'captcha_token': '',
+            },
+            headers={'Content-Type': 'application/json'},
+            timeout=15
+        ).json()
+        if r['code'] != 0:
+            raise RuntimeError(f"sort season episodes failed: {_safe_response_status(r)}")
+        return r
 
     def __enter__(self):
         return self
@@ -729,10 +996,12 @@ class Data:
     copyright: int = 2
     source: str = ''
     tid: int = 21
+    tid_v2: Optional[int] = None
     cover: str = ''
     title: str = ''
     desc_format_id: int = 0
     desc: str = ''
+    desc_v2: list = field(default_factory=list)
     dynamic: str = ''
     subtitle: dict = field(init=False)
     tag: Union[list, str] = ''
@@ -742,7 +1011,7 @@ class Data:
 
     # interactive: int = 0
     # no_reprint: int 1
-    # open_elec: int 1
+    # charging_pay: int 1
 
     def __post_init__(self, open_subtitle):
         self.subtitle = {"open": int(open_subtitle), "lan": ""}

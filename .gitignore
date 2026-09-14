@@ -26,6 +26,7 @@ dist/
 build/
 cover/
 cache/
+.cursor/
 
 *.back
 bili.cookie.json
@@ -42,3 +43,16 @@ qrcode.png
 data/
 .next
 out
+downloads/
+target
+_internal
+.trae/
+pnpm-lock.yaml
+cookies.json
+.augment/
+.cunzhi-memory/
+.serena/
+.cargo/
+logs/
+CLAUDE.md
+.claude/
